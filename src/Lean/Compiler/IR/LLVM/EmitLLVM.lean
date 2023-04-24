@@ -16,6 +16,7 @@ import Lean.Compiler.IR.SimpCase
 import Lean.Compiler.IR.Boxing
 import Lean.Compiler.IR.ResetReuse
 import Lean.Compiler.IR.LLVM.LLVMBindings
+import Lean.Compiler.IR.LLVM.CodeGeneratedBy
 
 open Lean.IR.ExplicitBoxing (isBoxedName)
 
@@ -33,6 +34,7 @@ namespace EmitLLVM
 
 structure Context (llvmctx : LLVM.Context) where
   env        : Environment
+  options    : Options
   modName    : Name
   jpMap      : JPParamsMap := {}
   mainFn     : FunId := default
@@ -67,6 +69,9 @@ def emitJp (jp : JoinPointId) : M llvmctx (LLVM.BasicBlock llvmctx) := do
 def getLLVMModule : M llvmctx (LLVM.Module llvmctx) := Context.llvmmodule <$> read
 
 def getEnv : M llvmctx Environment := Context.env <$> read
+
+instance : MonadOptions (M llvmctx) where
+  getOptions := Context.options <$> read
 
 def getModName : M llvmctx  Name := Context.modName <$> read
 
@@ -277,8 +282,8 @@ def toLLVMType (t : IRType) : M llvmctx (LLVM.LLVMType llvmctx) := do
   | IRType.object     => do LLVM.pointerType (← LLVM.i8Type llvmctx)
   | IRType.tobject    => do LLVM.pointerType (← LLVM.i8Type llvmctx)
   | IRType.irrelevant => do LLVM.pointerType (← LLVM.i8Type llvmctx)
-  | IRType.struct _ _ => panic! "not implemented yet"
-  | IRType.union _ _  => panic! "not implemented yet"
+  | IRType.struct _ _ => panic! "dead code"
+  | IRType.union _ _  => panic! "dead code"
 
 def throwInvalidExportName {α : Type} (n : Name) : M llvmctx α := do
   throw s!"invalid export name {n.toString}"
@@ -1091,10 +1096,51 @@ def emitDeclAux (mod : LLVM.Module llvmctx) (d : Decl) : M llvmctx Unit := do
       let llvmfn ← LLVM.getOrAddFunction mod name fnty
       withReader (fun llvmctx => { llvmctx with mainFn := f, mainParams := xs }) do
         set { var2val := default, jp2bb := default : EmitLLVM.State llvmctx } -- flush variable map
-        let bb ← LLVM.appendBasicBlockInContext llvmctx llvmfn "entry"
-        LLVM.positionBuilderAtEnd (← getBuilder) bb
+        let entrybb ← LLVM.appendBasicBlockInContext llvmctx llvmfn "entry"
+        LLVM.positionBuilderAtEnd (← getBuilder) entrybb
+        -- This name is bankrupt anyway, because `d` may get specialized.
+        -- Howver. Henrik has infomed me that extern declarations are passed
+        -- unmolested through the entire compiler pipelines, and thus this lookup
+        -- is in fact """legal""", since our `CodeGeneratedBy` attribute marks
+        -- definitions as `extern`.
         emitFnArgs needsPackedArgs? llvmfn xs
-        emitFnBody b
+        match ← LLVM.CodeGeneratedBy.getCodeGeneratorFromEnv? d.name (← getEnv) (← getOptions)  with
+        | some cgen =>
+          -- TODO: convert code generator state into an LLVM builder state.
+          -- TODO: convert the arguments of the function into LLVM builder registers.
+          let var2val := (← get).var2val
+          let entryBBId : LLVM.Pure.BBId := 0
+          let entryBB : LLVM.Pure.BasicBlock := { name := "entry" }
+          let initBuilderState : LLVM.Pure.PureBuilderState := {
+             bbs := HashMap.ofList [(entryBBId, entryBB)]
+          }
+          let mut argRegisters : Array LLVM.Pure.Reg := #[]
+          let mut registerFile : HashMap LLVM.Pure.Reg (LLVM.Value llvmctx) := {}
+          -- create a registers for each argument.
+          for (_var, (_ty, val)) in var2val.toList do
+            let reg := LLVM.Pure.Reg.ofNat argRegisters.size
+            argRegisters := argRegisters.push reg
+            registerFile := registerFile.insert reg val
+
+          -- TODO: create the correct initBuilderState
+          let pureBuilderState ← match (cgen argRegisters).run initBuilderState with
+            | .ok (_, state) => pure state
+            | .error err => throw err
+          -- instantiate the user's build commands.
+          let instantiationCtx : LLVM.Pure.InstantiationContext llvmctx := {
+            llvmmodule := mod,
+            llvmbuilder := (← getBuilder),
+            registerFile := registerFile,
+            basicBlocks := HashMap.ofList [(entryBBId, entrybb)]
+            -- TODO: we need to also ideally setup `functions`
+            -- to allow the user to find functions.
+            -- However, maybe we do not need `functions` since we can always lookup functions
+            -- in the context. Think about this.
+          }
+          -- Run the code generator to produce LLVM code.
+          pureBuilderState.instantiate instantiationCtx
+        | none =>
+          emitFnBody b
       pure ()
     | _ => pure ()
 
@@ -1109,7 +1155,7 @@ def emitDecl (mod : LLVM.Module llvmctx) (d : Decl) : M llvmctx Unit := do
 def emitFns (mod : LLVM.Module llvmctx) : M llvmctx Unit := do
   let env ← getEnv
   let decls := getDecls env
-  decls.reverse.forM (emitDecl mod)
+  decls.forM (emitDecl mod)
 
 def callIODeclInitFn (initFnName : String) (world : LLVM.Value llvmctx) : M llvmctx (LLVM.Value llvmctx) := do
   let retty ← LLVM.voidPtrType llvmctx
@@ -1454,13 +1500,13 @@ def optimizeLLVMModule (mod : LLVM.Module ctx) : IO Unit := do
 `emitLLVM` is the entrypoint for the lean shell to code generate LLVM.
 -/
 @[export lean_ir_emit_llvm]
-def emitLLVM (env : Environment) (modName : Name) (filepath : String) (tripleStr? : Option String) : IO Unit := do
+def emitLLVM (env : Environment) (options : Options) (modName : Name) (filepath : String) (tripleStr? : Option String) : IO Unit := do
   LLVM.llvmInitializeTargetInfo
   let llvmctx ← LLVM.createContext
   let module ← LLVM.createModule llvmctx modName.toString
   let builder ← LLVM.createBuilderInContext llvmctx
   let emitLLVMCtx : EmitLLVM.Context llvmctx :=
-    {env := env, modName := modName, llvmmodule := module, builder := builder}
+    {env := env, options := options, modName := modName, llvmmodule := module, builder := builder}
   let initState := { var2val := default, jp2bb := default : EmitLLVM.State llvmctx}
   let out? ← ((EmitLLVM.main (llvmctx := llvmctx)).run initState).run emitLLVMCtx
   match out? with

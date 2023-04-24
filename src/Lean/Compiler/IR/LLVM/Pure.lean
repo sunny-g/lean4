@@ -7,7 +7,7 @@ Authors: Henrik Böving, Siddharth Bhat
 import Lean.Data.HashMap
 import Lean.Compiler.IR.LLVM.LLVMBindings
 
-namespace Lean.Compiler.LLVM.Pure
+namespace Lean.IR.LLVM.Pure
 
 declare_syntax_cat llvm_ty
 declare_syntax_cat llvm_assignment
@@ -42,6 +42,7 @@ scoped syntax "[" num " × " llvm_ty "]" : llvm_ty
 
 abbrev BBId := UInt64
 abbrev Reg := UInt64
+def Reg.ofNat : Nat → Reg := UInt64.ofNat
 
 syntax llvm_reg := "%" noWs (num <|> ident)
 syntax llvm_bb_label := llvm_reg
@@ -84,7 +85,7 @@ scoped syntax "zext" llvm_ty llvm_reg "to" llvm_ty : llvm_instr
 scoped syntax "sext_or_trunc" llvm_ty llvm_reg "to" llvm_ty : llvm_instr
 scoped syntax "ptrtoint" llvm_ty llvm_reg "to" llvm_ty : llvm_instr
 scoped syntax "mul" llvm_ty llvm_reg ", " llvm_reg : llvm_instr
-scoped syntax "add" llvm_ty llvm_reg ", " llvm_reg : llvm_instr
+scoped syntax "llvm.add" llvm_ty llvm_reg ", " llvm_reg : llvm_instr -- this is bad, because 'add' is now stolen as syntax.
 scoped syntax "sub" llvm_ty llvm_reg ", " llvm_reg : llvm_instr
 scoped syntax "not" llvm_ty llvm_reg : llvm_instr
 
@@ -180,23 +181,23 @@ scoped syntax "[llvm_global|" llvm_global "]" : term
 -- TODO: this is literally BEGGING to be indexed by the type.
 abbrev FunctionId := UInt64
 
-structure BuilderState where
-  instrs : HashMap Reg Instruction
-  bbs : HashMap BBId BasicBlock
+structure PureBuilderState where
+  instrs : HashMap Reg Instruction := {}
+  bbs : HashMap BBId BasicBlock := {}
 
-  functionDefs : HashMap FunctionId FunctionDefinition
-  functionDecls : HashMap FunctionId FunctionDeclaration
+  functionDefs : HashMap FunctionId FunctionDefinition := {}
+  functionDecls : HashMap FunctionId FunctionDeclaration := {}
 
-  globalDefs : HashMap GlobalId GlobalDeclaration
-  globalDecls : HashMap GlobalId GlobalDefinition
+  globalDefs : HashMap GlobalId GlobalDeclaration := {}
+  globalDecls : HashMap GlobalId GlobalDefinition := {}
 
-  reg : UInt64
-  bbid : UInt64
-  functionId : UInt64
-  globalId : UInt64
+  reg : UInt64 := 0
+  bbid : UInt64 := 0
+  functionId : UInt64 := 0
+  globalId : UInt64 := 0
 
-  bbInsertionPt? : Option BBId
-  functionInsertionPt? : Option FunctionId
+  bbInsertionPt? : Option BBId := .none
+  functionInsertionPt? : Option FunctionId := .none
 
 /--
 We wish to allow users to lift into `MonadExceptString`. However, the classic style of
@@ -211,14 +212,25 @@ the instance `[MonadExceptOf IO.Error IO]` and `[Coe String IO.Error]` to synthe
 class MonadExceptString (m : Type → Type) where
   throwString : String → m α
 
-instance [Coe String ε] [MonadExcept ε m] : MonadExceptString m where
-  throwString := throw ∘ Coe.coe
+-- We want to enable use-cases where `ε = String`, so we
+-- depend on `CoeTC` instead of `Coe`, as `Coe` is not reflexive.
+instance [CoeTC String ε] [MonadExcept ε m] : MonadExceptString m where
+  throwString := throw ∘ CoeTC.coe
 
-class MonadBuilder (m : Type → Type) extends Monad m, MonadState BuilderState m, MonadExceptString m where
 
-instance [Monad m] [MonadState BuilderState m] [MonadExceptString m] : MonadBuilder m where
+class MonadBuilder (m : Type → Type) extends Monad m, MonadState PureBuilderState m, MonadExceptString m where
 
-abbrev BuilderM := StateRefT BuilderState IO
+instance [Monad m] [MonadState PureBuilderState m] [MonadExceptString m] : MonadBuilder m where
+
+-- TODO: change `String` to an error abbreviation.
+-- This morally does not need IO, but uses IO to enable `StateRefT`..
+abbrev BuilderM := StateRefT PureBuilderState (EST String Unit)
+
+def BuilderM.run (a : BuilderM α) (init : PureBuilderState) : Except String (α × PureBuilderState) :=
+  match StateRefT'.run a init |>.run () with
+  | .ok (val, state) _ => .ok (val, state)
+  | .error err _ => .error err
+
 
 namespace Builder
 
@@ -227,7 +239,7 @@ export MonadExceptString (throwString)
 variable {m : Type → Type} [MonadBuilder m]
 
 def regGen : m Reg :=
-  BuilderState.reg <$> getModify (fun s => { s with reg := s.reg + 1})
+  PureBuilderState.reg <$> getModify (fun s => { s with reg := s.reg + 1})
 
 def modifybb  (bbid : BBId) (f : BasicBlock → BasicBlock) : m Unit :=  do
   match (← get).bbs.find? bbid with
@@ -327,7 +339,7 @@ def setInsertionPoint (bbid : BBId) : m Unit := do
   modify fun s => { s with bbInsertionPt? := bbid }
 
 def functionIdGen : m FunctionId :=
-  BuilderState.functionId <$> getModify (fun s => { s with functionId := s.functionId + 1})
+  PureBuilderState.functionId <$> getModify (fun s => { s with functionId := s.functionId + 1})
 
 def buildFunctionDeclaration (decl : FunctionDeclaration) : m FunctionId := do
   let fid ← functionIdGen
@@ -343,7 +355,7 @@ def setFunctionInsertionPoint (fid : FunctionId) : m Unit :=
   modify (fun s => { s with functionInsertionPt? := fid })
 
 def globalIdGen : m GlobalId :=
-  BuilderState.globalId <$> getModify (fun s => { s with functionId := s.functionId + 1})
+  PureBuilderState.globalId <$> getModify (fun s => { s with functionId := s.functionId + 1})
 
 def buildGlobalDeclaration (decl : FunctionDeclaration) : m GlobalId := do
   let gid ← globalIdGen
@@ -379,7 +391,7 @@ scoped syntax "zext" llvm_ty llvm_reg "to" llvm_ty : llvm_instr
 scoped syntax "sext_or_trunc" llvm_ty llvm_reg "to" llvm_ty : llvm_instr
 scoped syntax "ptrtoint" llvm_ty llvm_reg "to" llvm_ty : llvm_instr
 scoped syntax "mul" llvm_ty llvm_reg ", " llvm_reg : llvm_instr
-scoped syntax "add" llvm_ty llvm_reg ", " llvm_reg : llvm_instr
+scoped syntax "llvm.add" llvm_ty llvm_reg ", " llvm_reg : llvm_instr
 scoped syntax "sub" llvm_ty llvm_reg ", " llvm_reg : llvm_instr
 scoped syntax "not" llvm_ty llvm_reg : llvm_instr
 
@@ -413,17 +425,17 @@ macro_rules
 structure InstantiationContext (llvmctx : LLVM.Context) where
   llvmmodule : LLVM.Module llvmctx
   llvmbuilder : LLVM.Builder llvmctx
-  registerFile : HashMap Reg (LLVM.Value llvmctx)
-  basicBlocks : HashMap BBId (LLVM.BasicBlock llvmctx)
-  functions : HashMap String (LLVM.Value llvmctx)
+  registerFile : HashMap Reg (LLVM.Value llvmctx) := {}
+  basicBlocks : HashMap BBId (LLVM.BasicBlock llvmctx) := {}
+  functions : HashMap String (LLVM.Value llvmctx) := {}
 
 abbrev InstantiationM (llvmctx : LLVM.Context) (α : Type) : Type :=
-  ReaderT BuilderState (StateRefT (InstantiationContext llvmctx) IO) α
+  ReaderT PureBuilderState (StateRefT (InstantiationContext llvmctx) IO) α
 
 def getLLVMBuilder : InstantiationM llvmctx (LLVM.Builder llvmctx) :=
   InstantiationContext.llvmbuilder <$> get
 
-def getBuilderState : InstantiationM llvmctx BuilderState :=
+def getBuilderState : InstantiationM llvmctx PureBuilderState :=
    read
 
 
@@ -548,11 +560,9 @@ def FunctionDefinition.instantiate (defn : FunctionDefinition) : InstantiationM 
       bb.instrs.forM (fun namedInstr => do let _ ← Instruction.instantiate namedInstr.value)
       let _ ← bb.terminator.instantiate
 
--- create an LLVM module that maps the pure 'BuilderState' into a real LLVM module pointer.
-def BuilderState.instantiate (modName : Name) (state : BuilderState) : InstantiationM llvmctx (LLVM.Module llvmctx) := do
-  let module ← LLVM.createModule llvmctx modName.toString
-  let _builder ← LLVM.createBuilderInContext llvmctx
-
+-- create an LLVM module that maps the pure 'PureBuilderState' into a real LLVM module pointer.
+def instantiateToplevel : InstantiationM llvmctx Unit := do
+  let state ← getBuilderState
   -- 1. Create all function declarations up-front, to allow for mutual
   --    definitions
   for (_declName, decl) in (state.functionDecls.toArray) do
@@ -561,6 +571,11 @@ def BuilderState.instantiate (modName : Name) (state : BuilderState) : Instantia
   for (_defnName, defn) in state.functionDefs.toArray do
     let _ ← defn.toFunctionDeclaration.instantiate
     defn.instantiate
-  return module
 
-end Lean.Compiler.LLVM.Pure
+def InstantiationM.run' (m : InstantiationM llvmctx α) (s : PureBuilderState) (instantiationCtx : InstantiationContext llvmctx) : IO α :=
+  ReaderT.run m s |>.run' instantiationCtx
+
+def PureBuilderState.instantiate (s : PureBuilderState) (instantiationCtx : InstantiationContext llvmctx) : IO Unit :=
+  InstantiationM.run' instantiateToplevel s instantiationCtx
+
+end Lean.IR.LLVM.Pure
