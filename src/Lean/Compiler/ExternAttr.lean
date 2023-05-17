@@ -64,7 +64,7 @@ private def syntaxToExternAttrData (declName : Name) (stx : Syntax) : AttrM Exte
         let genName ← Elab.resolveGlobalConstNoOverloadWithInfo entryStx[2]
         let info ← getConstInfo genName
         unless info.type.constName? == some `Lean.IR.LLVM.CodeGeneratedBy.CodeGenerator do
-          throwError "Expected type 'CodeGenerator', found incorrect type '{info.type}'. Invalid code generator declaration at '{declName}', generator: '{genName}'."
+          throwError "Expected type 'Lean.IR.LLVM.CodeGeneratedBy.CodeGenerator', found incorrect type '{info.type}'. Invalid code generator declaration at '{declName}', generator: '{genName}'."
         entries := entries.push <| ExternEntry.codeGeneratedBy genName
       | _ => unreachable!
   return { arity? := arity?, entries := entries.toList }
