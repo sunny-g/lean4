@@ -541,39 +541,6 @@ def quoteString (s : String) : String :=
     q;
   q ++ "\""
 
-def emitSimpleExternalCall (f : String) (ps : Array Param) (ys : Array Arg) (retty : IRType) (name : String) : M llvmctx (LLVM.Value llvmctx) := do
-  let mut args := #[]
-  let mut argTys := #[]
-  for (p, y) in ps.zip ys do
-    if !p.ty.isIrrelevant then
-      let (_yty, yv) ← emitArgVal y ""
-      argTys := argTys.push (← toLLVMType p.ty)
-      args := args.push yv
-  let fnty ← LLVM.functionType (← toLLVMType retty) argTys
-  let fn ← LLVM.getOrAddFunction (← getLLVMModule) f fnty
-  LLVM.buildCall2 (← getBuilder) fnty fn args name
-
--- TODO: if the external call is one that we cannot code generate, give up and
--- generate fallback code.
-def emitExternCall
-    (f : FunId)
-    (ps : Array Param)
-    (extData : ExternAttrData)
-    (ys : Array Arg) (retty : IRType)
-    (name : String := "") : M llvmctx (LLVM.Value llvmctx) :=
-  match getExternEntryFor extData `c with
-  | some (ExternEntry.standard _ extFn) => emitSimpleExternalCall extFn ps ys retty name
-  | some (ExternEntry.inline "llvm" _pat) => throw "Unimplemented codegen of inline LLVM"
-  | some (ExternEntry.inline _ pat) => throw s!"Cannot codegen non-LLVM inline code '{pat}'."
-  | some (ExternEntry.foreign _ extFn)  => emitSimpleExternalCall extFn ps ys retty name
-  | _ => throw s!"Failed to emit extern application '{f}'."
-
-def getFunIdTy (f : FunId) : M llvmctx (LLVM.LLVMType llvmctx) := do
-  let decl ← getDecl f
-  let retty ← toLLVMType decl.resultType
-  let argtys ← decl.params.mapM (fun p => do toLLVMType p.ty)
-  LLVM.functionType retty argtys
-
 /--
 Create a function declaration and return a pointer to the function.
 If the function actually takes arguments, then we must have a function pointer in scope.
@@ -592,6 +559,72 @@ def getOrAddFunIdValue (f : FunId) : M llvmctx (LLVM.Value llvmctx) := do
     let argtys ← decl.params.mapM (fun p => do toLLVMType p.ty)
     let fnty ← LLVM.functionType retty argtys
     LLVM.getOrAddFunction (← getLLVMModule) fcname fnty
+
+def emitSimpleExternalCall (f : String) (ps : Array Param) (ys : Array Arg) (retty : IRType) (name : String) : M llvmctx (LLVM.Value llvmctx) := do
+  let mut args := #[]
+  let mut argTys := #[]
+  for (p, y) in ps.zip ys do
+    if !p.ty.isIrrelevant then
+      let (_yty, yv) ← emitArgVal y ""
+      argTys := argTys.push (← toLLVMType p.ty)
+      args := args.push yv
+  let fnty ← LLVM.functionType (← toLLVMType retty) argTys
+  let fn ← LLVM.getOrAddFunction (← getLLVMModule) f fnty
+  LLVM.buildCall2 (← getBuilder) fnty fn args name
+
+def getFunIdTy (f : FunId) : M llvmctx (LLVM.LLVMType llvmctx) := do
+  let decl ← getDecl f
+  let retty ← toLLVMType decl.resultType
+  let argtys ← decl.params.mapM (fun p => do toLLVMType p.ty)
+  LLVM.functionType retty argtys
+
+/- amazing Henrik, we have rediscovered destination passing style! -/
+def emitFullAppGo (z : VarId) (f : FunId) (ys : Array Arg) (zslot : LLVM.Value llvmctx): M llvmctx Unit := do
+  if ys.size > 0 then
+      let fv ← getOrAddFunIdValue f
+      let ys ←  ys.mapM (fun y => do
+          let (yty, yslot) ← emitArgSlot_ y
+          let yv ← LLVM.buildLoad2 (← getBuilder) yty yslot
+          return yv)
+      let zv ← LLVM.buildCall2 (← getBuilder) (← getFunIdTy f) fv ys
+      let _ ← LLVM.buildStore (← getBuilder) zv zslot
+  else
+      let zv ← getOrAddFunIdValue f
+      let _ ← LLVM.buildStore (← getBuilder) zv zslot
+
+-- TODO: if the external call is one that we cannot code generate, give up and
+-- generate fallback code.
+def emitExternCall
+    (f : FunId)
+    (ps : Array Param)
+    (extData : ExternAttrData)
+    (ys : Array Arg) (retty : IRType)
+    (z : VarId) (zslot : LLVM.Value llvmctx)
+    (name : String := "") : M llvmctx (LLVM.Value llvmctx) :=
+  match getExternEntryFor extData `c with
+  | some (ExternEntry.standard _ extFn) => emitSimpleExternalCall extFn ps ys retty name
+  | some (ExternEntry.inline "llvm" _pat) => throw "Unimplemented codegen of inline LLVM"
+  | some (ExternEntry.inline _ pat) => throw s!"Cannot codegen non-LLVM inline code '{pat}'."
+  | some (ExternEntry.foreign _ extFn)  => emitSimpleExternalCall extFn ps ys retty name
+  | _ =>
+    match getExternEntryFor extData `llvm with
+    | some (ExternEntry.codeGeneratedBy _fn) => do
+      emitFullAppGo z f ys zslot
+      -- TODO: think if this is in fact correct.
+      let zval ← LLVM.buildLoad2 (← getBuilder) (← toLLVMType retty) zslot
+      return zval
+    | _ =>
+      throw s!"Failed to emit extern application '{f}'."
+
+def emitFullApp (z : VarId) (f : FunId) (ys : Array Arg) : M llvmctx Unit := do
+  let (__zty, zslot) ← emitLhsSlot_ z
+  let decl ← getDecl f
+  match decl with
+  | Decl.extern _ ps retty extData =>
+     let zv ← emitExternCall f ps extData ys retty z zslot
+     let _ ← LLVM.buildStore (← getBuilder) zv zslot
+  | Decl.fdecl .. => emitFullAppGo z f ys zslot
+
 
 def emitPartialApp (z : VarId) (f : FunId) (ys : Array Arg) : M llvmctx Unit := do
   let decl ← getDecl f
@@ -635,25 +668,7 @@ def emitApp (z : VarId) (f : VarId) (ys : Array Arg) : M llvmctx Unit := do
     let zv ← LLVM.buildCall2 (← getBuilder) fnty fn args
     emitLhsSlotStore z zv
 
-def emitFullApp (z : VarId) (f : FunId) (ys : Array Arg) : M llvmctx Unit := do
-  let (__zty, zslot) ← emitLhsSlot_ z
-  let decl ← getDecl f
-  match decl with
-  | Decl.extern _ ps retty extData =>
-     let zv ← emitExternCall f ps extData ys retty
-     let _ ← LLVM.buildStore (← getBuilder) zv zslot
-  | Decl.fdecl .. =>
-    if ys.size > 0 then
-        let fv ← getOrAddFunIdValue f
-        let ys ←  ys.mapM (fun y => do
-            let (yty, yslot) ← emitArgSlot_ y
-            let yv ← LLVM.buildLoad2 (← getBuilder) yty yslot
-            return yv)
-        let zv ← LLVM.buildCall2 (← getBuilder) (← getFunIdTy f) fv ys
-        let _ ← LLVM.buildStore (← getBuilder) zv zslot
-    else
-       let zv ← getOrAddFunIdValue f
-       let _ ← LLVM.buildStore (← getBuilder) zv zslot
+
 
 -- Note that this returns a *slot*, just like `emitLhsSlot_`.
 def emitLit (z : VarId) (t : IRType) (v : LitVal) : M llvmctx (LLVM.Value llvmctx) := do
@@ -1074,6 +1089,7 @@ def emitFnArgs (needsPackedArgs? : Bool)  (llvmfn : LLVM.Value llvmctx) (params 
         let arg ← LLVM.getParam llvmfn (UInt64.ofNat i)
         let _ ← LLVM.buildStore (← getBuilder) arg alloca
         addVartoState params[i]!.x alloca llvmty
+
 
 def emitDeclAux (mod : LLVM.Module llvmctx) (d : Decl) : M llvmctx Unit := do
   let env ← getEnv
