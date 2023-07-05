@@ -6,7 +6,22 @@ which enables code generation for a variety of targets using the
 
 To build the LLVM backend, perform the following steps:
 
-1. Install `llvm-15`.
+1. Install `llvm-15`. This can either be done from your package manager or by
+   building it from source.
+   Compiling from source requires the following steps:
+   1. Obtain the source code from [https://github.com/llvm/llvm-project](https://github.com/llvm/llvm-project)
+      and check out the tag `llvmorg-15.0.7`
+   2. Configure the build via `cmake`. A minimum set of flags to make it
+      succeed on an x86 machine would be:
+      ```
+      cmake -S llvm -B build -G Ninja -DLLVM_ENABLE_PROJECTS="clang" -DLLVM_TARGETS_TO_BUILD=X86 -DCMAKE_BUILD_TYPE=Release -DLLVM_LINK_LLVM_DYLIB=ON -DCMAKE_INSTALL_PREFIX=/my/prefix/llvm-15
+      ```
+      It is important to compile clang from source as well to avoid a situation
+      where your system has a newer variant of clang that outputs bitcode
+      (`lean_runtime.bc`) which the variant that we are compiling Lean with
+      does not understand anymore.
+   3. Compile and install via `ninja -C build install`
+   4. Set your `$PATH`: `export PATH=/my/prefix/llvm-15/bin:$PATH`
 2. Build lean with the extra cmake flags:
 
 ```
