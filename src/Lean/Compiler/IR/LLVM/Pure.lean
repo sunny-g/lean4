@@ -5,7 +5,6 @@ Authors: Henrik Böving, Siddharth Bhat
 -/
 
 import Lean.Data.HashMap
-import Lean.Compiler.IR.LLVM.LLVMBindings
 
 namespace Lean.IR.LLVM.Pure
 
@@ -49,6 +48,19 @@ syntax llvm_bb_label := llvm_reg
 syntax llvm_sym := "@" noWs (num <|> ident)
 syntax llvm_value := llvm_reg -- TODO: extend with LLVM constants on demand
 
+inductive IntPredicate where
+| eq
+| ne
+| ugt
+| uge
+| ult
+| ule
+| sgt
+| sge
+| slt
+| sle
+deriving Inhabited, BEq
+
 inductive Instruction where
 | alloca (ty : Ty) (name : String)
 | load2 (ty : Ty) (val : Reg) (name : String)
@@ -63,7 +75,7 @@ inductive Instruction where
 | add (lhs rhs : Reg) (name : String)
 | sub (lhs rhs : Reg) (name : String)
 | not (arg : Reg) (name : String)  -- -- TODO: remove pseudo-instruction, provide builder.
-| icmp (pred : LLVM.IntPredicate) (lhs rhs : Reg) (name : String)
+| icmp (pred : IntPredicate) (lhs rhs : Reg) (name : String)
 | phi (ty : Ty) (args : Array (BBId × Reg))
 deriving Inhabited, BEq
 
@@ -102,6 +114,7 @@ inductive Terminator where
 | condbr (val : Reg) (then_ else_ : BBId)
 | ret (val : Reg)
 | switch (val : Reg) (cases : Array (Reg × BBId)) (default : BBId)
+deriving Repr
 
 /-- We use Terminator.default to signal that this BB does not have a terminator assigned yet. -/
 instance : Inhabited Terminator where
@@ -132,11 +145,10 @@ scoped syntax ident noWs ":"
     (colEq (llvm_assignment <|> llvm_instr) linebreak)*
     llvm_terminator : llvm_bb
 
-abbrev Arg := String × Ty
 structure FunctionDeclaration where
   name : String
-  args : Array Arg := #[]
-  retty : Ty := Ty.void
+  args : Array Ty
+  retty : Ty
 
 
 scoped syntax "declare" llvm_ty llvm_sym "(" (llvm_ty),* ")" : llvm_function
@@ -196,8 +208,8 @@ structure PureBuilderState where
   functionId : UInt64 := 0
   globalId : UInt64 := 0
 
-  bbInsertionPt? : Option BBId := .none
-  functionInsertionPt? : Option FunctionId := .none
+  bbInsertionPt? : Option BBId
+  functionInsertionPt? : Option FunctionId
 
 /--
 We wish to allow users to lift into `MonadExceptString`. However, the classic style of
@@ -300,7 +312,7 @@ def Sub (lhs rhs : Reg) (name : String) : m Reg :=
 def Not (arg : Reg) (name : String) : m Reg :=
   buildInstrWithDest (.not arg name)
 
-def Icmp (pred : LLVM.IntPredicate) (lhs rhs : Reg) (name : String) : m Reg :=
+def Icmp (pred : IntPredicate) (lhs rhs : Reg) (name : String) : m Reg :=
   buildInstrWithDest (.icmp pred lhs rhs name)
 
 def Phi (ty : Ty) (args : Array (BBId × Reg)) : m Reg :=
@@ -378,7 +390,7 @@ inductive Instruction where
 | add (lhs rhs : Reg) (name : String)
 | sub (lhs rhs : Reg) (name : String)
 | not (arg : Reg) (name : String) -- -- TODO: remove pseudo-instruction, provide builder.
-| icmp (pred : LLVM.IntPredicate) (lhs rhs : Reg) (name : String)
+| icmp (pred : IntPredicate) (lhs rhs : Reg) (name : String)
 | phi (ty : Ty) (args : Array (BBId × Reg))
 deriving Inhabited, BEq
 
@@ -422,160 +434,5 @@ macro_rules
     ``(Ty.array [llvm_ty| $ty] ($n : UInt64))
 | `([llvm_ty| $$($q)]) => `($q)
 
-structure InstantiationContext (llvmctx : LLVM.Context) where
-  llvmmodule : LLVM.Module llvmctx
-  llvmbuilder : LLVM.Builder llvmctx
-  registerFile : HashMap Reg (LLVM.Value llvmctx) := {}
-  basicBlocks : HashMap BBId (LLVM.BasicBlock llvmctx) := {}
-  functions : HashMap String (LLVM.Value llvmctx) := {}
-
-abbrev InstantiationM (llvmctx : LLVM.Context) (α : Type) : Type :=
-  ReaderT PureBuilderState (StateRefT (InstantiationContext llvmctx) IO) α
-
-def getLLVMBuilder : InstantiationM llvmctx (LLVM.Builder llvmctx) :=
-  InstantiationContext.llvmbuilder <$> get
-
-def getBuilderState : InstantiationM llvmctx PureBuilderState :=
-   read
-
-
-def getModule : InstantiationM llvmctx (LLVM.Module llvmctx) :=
-  InstantiationContext.llvmmodule <$> get
-def getRegisterFile : InstantiationM llvmctx (HashMap Reg (LLVM.Value llvmctx)) :=
-  InstantiationContext.registerFile <$> get
-
-def getBasicBlocks : InstantiationM llvmctx (HashMap BBId (LLVM.BasicBlock llvmctx)) :=
-  InstantiationContext.basicBlocks <$> get
-
-def getFunctions : InstantiationM llvmctx (HashMap String (LLVM.Value llvmctx)) :=
-  InstantiationContext.functions <$> get
-
-partial def Ty.instantiate : Ty → InstantiationM llvmctx (LLVM.LLVMType llvmctx)
-| .function args retTy => do
-  LLVM.functionType (← retTy.instantiate) (← args.mapM Ty.instantiate)
-| .void => LLVM.voidType llvmctx -- TODO: change function name to `LLVM.voidTypeInContext`
-| .int width => LLVM.intTypeInContext llvmctx width
-| .opaquePointer addrspace => LLVM.opaquePointerTypeInContext llvmctx addrspace
-| .float => LLVM.floatTypeInContext llvmctx
-| .double => LLVM.doubleTypeInContext llvmctx
-| .array elemty nelem => do LLVM.arrayType (← elemty.instantiate) nelem
-
-def FunctionDeclaration.instantiate (decl : FunctionDeclaration) : InstantiationM llvmctx (LLVM.Value llvmctx) := do
-  let fnty ← (Ty.function (decl.args.map Prod.snd) decl.retty).instantiate
-  let fn ← LLVM.getOrAddFunction (← getModule) decl.name fnty
-  modify (fun s => { s with functions := s.functions.insert decl.name fn })
-  return fn
-
-
-def Reg.instantiate (reg : Reg) : InstantiationM llvmctx (LLVM.Value llvmctx) := do
-  match (← getRegisterFile).find? reg with
-  | .none => throw <| .userError s!"unable to find register '{reg}', this is a miscompilation."
-  | .some v => return v
-
-def BBId.instantiate (bbid : BBId) : InstantiationM llvmctx (LLVM.BasicBlock llvmctx) := do
-  match (← getBasicBlocks).find? bbid with
-  | .none => throw <| .userError s!"unable to find basic block '{bbid}', this is a miscompilation."
-  | .some v => return v
-
-def Instruction.instantiate : Instruction → InstantiationM llvmctx (LLVM.Value llvmctx)
-| .alloca ty name => do
-   LLVM.buildAlloca (← getLLVMBuilder) (← ty.instantiate) name
-| .load2 ty val name => do
-    LLVM.buildLoad2 (← getLLVMBuilder) (← ty.instantiate) (← val.instantiate) name
-| .store val pointer => do
-    LLVM.buildStore (← getLLVMBuilder) (← val.instantiate) (← pointer.instantiate)
-| .gep ty base ixs => do
-  LLVM.buildGEP2 (← getLLVMBuilder) (← ty.instantiate) (← base.instantiate) (← ixs.mapM Reg.instantiate)
-| .inboundsgep ty base ixs => do
-  LLVM.buildInBoundsGEP2 (← getLLVMBuilder) (← ty.instantiate) (← base.instantiate) (← ixs.mapM Reg.instantiate)
-| .sext val destTy => do
-  LLVM.buildSext (← getLLVMBuilder) (← val.instantiate) (← destTy.instantiate)
-| .zext val destTy => do
-  LLVM.buildZext (← getLLVMBuilder) (← val.instantiate) (← destTy.instantiate)
-| .sext_or_trunc val destTy => do
-  LLVM.buildSextOrTrunc (← getLLVMBuilder) (← val.instantiate) (← destTy.instantiate)
-| .ptrtoint pointer destTy => do
-  LLVM.buildPtrToInt (← getLLVMBuilder) (← pointer.instantiate) (← destTy.instantiate)
-| .mul lhs rhs name => do
-  LLVM.buildMul (← getLLVMBuilder) (← lhs.instantiate) (← rhs.instantiate) name
-| .add lhs rhs name => do
-  LLVM.buildAdd (← getLLVMBuilder) (← lhs.instantiate) (← rhs.instantiate) name
-| .sub lhs rhs name => do
-  LLVM.buildSub (← getLLVMBuilder) (← lhs.instantiate) (← rhs.instantiate) name
-| .not arg name => do
-  LLVM.buildNot (← getLLVMBuilder) (← arg.instantiate) name
-| .icmp pred lhs rhs name => do
-  LLVM.buildICmp (← getLLVMBuilder) pred (← lhs.instantiate) (← rhs.instantiate) name
-| .phi ty bbIdAndVals => do
-  let phiNode ← LLVM.buildPhi (← getLLVMBuilder) (← ty.instantiate)
-  let vals : Array (LLVM.Value llvmctx) ← bbIdAndVals.mapM (Reg.instantiate ∘ Prod.snd)
-  let bbs : Array (LLVM.BasicBlock llvmctx) ← bbIdAndVals.mapM (BBId.instantiate ∘ Prod.fst)
-  LLVM.addIncoming phiNode vals bbs
-  return phiNode
-
-def reassureUserString : String := "This is a compiler bug."
-
-def findBasicBlock! (bbid : BBId) : InstantiationM llvmctx (LLVM.BasicBlock llvmctx) := do
-  let some bb := (← getBasicBlocks).find? bbid
-    | throw <| .userError s!"Unable to find LLVM basic block {bbid}. {reassureUserString}"
-  return bb
-
-def findReg! (reg : Reg) : InstantiationM llvmctx (LLVM.Value llvmctx) := do
-  let some v := (← getRegisterFile).find? reg
-    | throw <| .userError s!"UnabuildRetble to find LLVM value {reg}. {reassureUserString}"
-  return v
-
-def Terminator.instantiate : Terminator → InstantiationM llvmctx (LLVM.Value llvmctx)
-| .default => throw <| .userError s!"should not have default when instantiating terminator. {reassureUserString}"
-| .unreachable => do LLVM.buildUnreachable (← getLLVMBuilder)
-| .br bbid => do
-    LLVM.buildBr (← getLLVMBuilder) (← findBasicBlock! bbid)
-| .condbr val then_ else_ => do
-    LLVM.buildCondBr (← getLLVMBuilder) (← findReg! val) (← findBasicBlock! then_) (← findBasicBlock! else_)
-| .ret val => do LLVM.buildRet (← getLLVMBuilder) (← findReg! val)
-| .switch val cases defCase => do
-    let switchInstr ← LLVM.buildSwitch (← getLLVMBuilder) (← findReg! val) (← findBasicBlock! defCase)
-                    (UInt64.ofNat cases.size)
-    cases.forM (fun (val, bb) => do LLVM.addCase switchInstr (← findReg! val) (← findBasicBlock! bb))
-    return switchInstr
-
-def FunctionDefinition.instantiate (defn : FunctionDefinition) : InstantiationM llvmctx Unit := do
-  let some llvmfn := (← getFunctions).find? defn.name
-    | throw <| .userError s!"Unable to find LLVM function declaration for {defn.name}. {reassureUserString}"
-
-  let mut llvmbbs : Array (BasicBlock × LLVM.BasicBlock llvmctx) :=
-    Array.mkEmpty defn.body.size
-  -- generate basic blocks. Only after generating all the basic blocks
-  -- do we fill them in with instructions to allow for mutual dependencies in
-  -- the control flow graph.
-  for bbid in defn.body do
-    let some bb := (← getBuilderState).bbs.find? bbid
-      | throw <| .userError s!"Unable to find LLVM Basic block {bbid}. {reassureUserString}"
-    let llvmbb ← LLVM.appendBasicBlockInContext llvmctx llvmfn bb.name
-    llvmbbs := llvmbbs.push (bb, llvmbb)
-    modify fun s => { s with basicBlocks := s.basicBlocks.insert bbid llvmbb }
-
-  for (bb, llvmbb) in llvmbbs do
-      LLVM.positionBuilderAtEnd (← getLLVMBuilder) llvmbb
-      bb.instrs.forM (fun namedInstr => do let _ ← Instruction.instantiate namedInstr.value)
-      let _ ← bb.terminator.instantiate
-
--- create an LLVM module that maps the pure 'PureBuilderState' into a real LLVM module pointer.
-def instantiateToplevel : InstantiationM llvmctx Unit := do
-  let state ← getBuilderState
-  -- 1. Create all function declarations up-front, to allow for mutual
-  --    definitions
-  for (_declName, decl) in (state.functionDecls.toArray) do
-    let _ ← decl.instantiate
-
-  for (_defnName, defn) in state.functionDefs.toArray do
-    let _ ← defn.toFunctionDeclaration.instantiate
-    defn.instantiate
-
-def InstantiationM.run' (m : InstantiationM llvmctx α) (s : PureBuilderState) (instantiationCtx : InstantiationContext llvmctx) : IO α :=
-  ReaderT.run m s |>.run' instantiationCtx
-
-def PureBuilderState.instantiate (s : PureBuilderState) (instantiationCtx : InstantiationContext llvmctx) : IO Unit :=
-  InstantiationM.run' instantiateToplevel s instantiationCtx
 
 end Lean.IR.LLVM.Pure

@@ -10,10 +10,10 @@ namespace Lean.IR.LLVM.CodeGeneratedBy
 open Lean
 open Lean.IR.LLVM.Pure
 
-def CodeGenerator : Type := Array Reg → BuilderM Reg
+def CodeGenerator : Type := Array Reg → BuilderM Unit
 
 instance : Inhabited CodeGenerator where
-  default := fun _ => pure (0 : Reg)
+  default := fun _ => pure ()
 
 private unsafe def lookupCodeGeneratorFromNameUnsafe (name : Name) (env : Environment) (opt : Options) : Except String CodeGenerator := do
   env.evalConst CodeGenerator opt name

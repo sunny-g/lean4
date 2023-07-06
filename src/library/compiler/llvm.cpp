@@ -1135,6 +1135,9 @@ extern "C" LEAN_EXPORT lean_object *lean_llvm_link_modules(size_t /* ctx */,
 #else
     int is_error = LLVMLinkModules2(lean_to_Module(dest_module),
                                     lean_to_Module(src_module));
+    char* mod = LLVMPrintModuleToString(lean_to_Module(dest_module));
+    fprintf(stderr, "%s\n", mod);
+    free(mod);
 
     if (is_error) {
         fprintf(stderr, "%20s ERROR: unable to link modules\n", __FUNCTION__);

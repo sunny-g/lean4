@@ -17,6 +17,7 @@ import Lean.Compiler.IR.Boxing
 import Lean.Compiler.IR.ResetReuse
 import Lean.Compiler.IR.LLVM.LLVMBindings
 import Lean.Compiler.IR.LLVM.CodeGeneratedBy
+import Lean.Compiler.IR.LLVM.PureSemantics
 
 open Lean.IR.ExplicitBoxing (isBoxedName)
 
@@ -271,19 +272,7 @@ def callLeanCtorSetTag (closure i : LLVM.Value llvmctx) (retName : String := "")
   let _ ← LLVM.buildCall2 (← getBuilder) fnty fn  #[closure, i] retName
 
 def toLLVMType (t : IRType) : M llvmctx (LLVM.LLVMType llvmctx) := do
-  match t with
-  | IRType.float      => LLVM.doubleTypeInContext llvmctx
-  | IRType.uint8      => LLVM.intTypeInContext llvmctx 8
-  | IRType.uint16     => LLVM.intTypeInContext llvmctx 16
-  | IRType.uint32     => LLVM.intTypeInContext llvmctx 32
-  | IRType.uint64     => LLVM.intTypeInContext llvmctx 64
-  -- TODO: how to cleanly size_t in LLVM? We can do eg. instantiate the current target and query for size.
-  | IRType.usize      => LLVM.size_tType llvmctx
-  | IRType.object     => do LLVM.pointerType (← LLVM.i8Type llvmctx)
-  | IRType.tobject    => do LLVM.pointerType (← LLVM.i8Type llvmctx)
-  | IRType.irrelevant => do LLVM.pointerType (← LLVM.i8Type llvmctx)
-  | IRType.struct _ _ => panic! "dead code"
-  | IRType.union _ _  => panic! "dead code"
+  LLVM.Pure.Ty.ofIRType t |>.instantiate
 
 def throwInvalidExportName {α : Type} (n : Name) : M llvmctx α := do
   throw s!"invalid export name {n.toString}"
@@ -1091,6 +1080,79 @@ def emitFnArgs (needsPackedArgs? : Bool)  (llvmfn : LLVM.Value llvmctx) (params 
         addVartoState params[i]!.x alloca llvmty
 
 
+/--
+Emit the function declaration using the FFI.
+This ensures that the state of `emitDeclAuxRegular` lives entirely in the FFI state.
+-/
+def emitDeclAuxRegular (mod : LLVM.Module llvmctx) (d : Decl) (name : String) (argtys : Array LLVM.Pure.Ty) (retty : LLVM.Pure.Ty) (needsPackedArgs? : Bool) : M llvmctx Unit := do
+  let fnty ← LLVM.functionType (← retty.instantiate) (← liftM <| argtys.mapM LLVM.Pure.Ty.instantiate) (isVarArg := false)
+  let env ← getEnv
+  let (_, jpMap) := mkVarJPMaps d
+  withReader (fun llvmctx => { llvmctx with jpMap := jpMap }) do
+  unless hasInitAttr env d.name do
+    match d with
+    | .fdecl (f := f) (xs := xs) (body := b) .. =>
+      let llvmfn ← LLVM.getOrAddFunction mod name fnty
+      withReader (fun llvmctx => { llvmctx with mainFn := f, mainParams := xs }) do
+        set { var2val := default, jp2bb := default : EmitLLVM.State llvmctx } -- flush variable map
+        let entrybb ← LLVM.appendBasicBlockInContext llvmctx llvmfn "entry"
+        LLVM.positionBuilderAtEnd (← getBuilder) entrybb
+        emitFnArgs needsPackedArgs? llvmfn xs
+        emitFnBody b
+      pure ()
+    | _ => pure ()
+
+def emitDeclAuxCgen (mod : LLVM.Module llvmctx) (d : Decl) (cgen : LLVM.CodeGeneratedBy.CodeGenerator) (name : String) (argtys : Array LLVM.Pure.Ty) (retty : LLVM.Pure.Ty) : M llvmctx Unit := do
+  IO.println s!"Found cgen for: '{d.name}'"
+  let var2val := (← get).var2val
+  let functionId : LLVM.Pure.FunctionId := 0
+  let entryBBId : LLVM.Pure.BBId := 0
+  let entryBB : LLVM.Pure.BasicBlock := { name := "entry" }
+  let mut argRegisters : Array LLVM.Pure.Reg := #[]
+  let mut registerFile : HashMap LLVM.Pure.Reg (LLVM.Value llvmctx) := {}
+  -- create a registers for each argument.
+  for (_var, (_ty, val)) in var2val.toList do
+    let reg := LLVM.Pure.Reg.ofNat argRegisters.size
+    argRegisters := argRegisters.push reg
+    registerFile := registerFile.insert reg val
+  let functionDecl : LLVM.Pure.FunctionDeclaration := {
+    name := name,
+    args := argtys,
+    retty := retty
+  }
+  let functionDef : LLVM.Pure.FunctionDefinition := .mk functionDecl #[entryBBId]
+  let initBuilderState : LLVM.Pure.PureBuilderState := {
+     bbs := HashMap.ofList [(entryBBId, entryBB)],
+     functionDecls := {},
+     functionDefs := HashMap.ofList [(functionId, functionDef)],
+     -- TODO: global defs?
+     bbInsertionPt? := some 0,
+     functionInsertionPt? := some 0 
+  }
+  let pureBuilderState ←
+    match (cgen argRegisters).run initBuilderState with
+    | .ok (() , s) => pure s
+    | .error err => throw err
+
+  -- Run the code generator to produce LLVM code.
+  pureBuilderState.instantiate mod (← getBuilder) registerFile
+
+def emitDeclAux (mod : LLVM.Module llvmctx) (d : Decl) : M llvmctx Unit := do
+  let baseName ← toCName d.name
+  let name := if d.params.size > 0 then baseName else "_init_" ++ baseName
+  let retty := LLVM.Pure.Ty.ofIRType d.resultType
+  let mut argtys := #[]
+  let needsPackedArgs? := d.params.size > closureMaxArgs && isBoxedName d.name
+  if needsPackedArgs? then
+      argtys := #[LLVM.Pure.Ty.ofIRType .object]
+  else
+    for arg in d.params do
+      argtys := argtys.push (LLVM.Pure.Ty.ofIRType arg.ty)
+  match ← LLVM.CodeGeneratedBy.getCodeGeneratorFromEnv? d.name (← getEnv) (← getOptions) with
+  | some cgen => emitDeclAuxCgen mod d cgen name argtys retty
+  | none => emitDeclAuxRegular mod d name argtys retty needsPackedArgs?
+
+/-
 def emitDeclAux (mod : LLVM.Module llvmctx) (d : Decl) : M llvmctx Unit := do
   let env ← getEnv
   let (_, jpMap) := mkVarJPMaps d
@@ -1140,10 +1202,10 @@ def emitDeclAux (mod : LLVM.Module llvmctx) (d : Decl) : M llvmctx Unit := do
 
           -- TODO: create the correct initBuilderState
           let pureBuilderState ← match (cgen argRegisters).run initBuilderState with
-            | .ok (_, state) => pure state
+            | .ok (() , state) => pure state
             | .error err => throw err
           -- instantiate the user's build commands.
-          let instantiationCtx : LLVM.Pure.InstantiationContext llvmctx := {
+          let instantiationCtx : LLVM.Pure.InstantiationState llvmctx := {
             llvmmodule := mod,
             llvmbuilder := (← getBuilder),
             registerFile := registerFile,
@@ -1159,6 +1221,7 @@ def emitDeclAux (mod : LLVM.Module llvmctx) (d : Decl) : M llvmctx Unit := do
           emitFnBody b
       pure ()
     | _ => pure ()
+-/
 
 def emitDecl (mod : LLVM.Module llvmctx) (d : Decl) : M llvmctx Unit := do
   let d := d.normalizeIds -- ensure we don't have gaps in the variable indices

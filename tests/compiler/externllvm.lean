@@ -1,11 +1,10 @@
-import Lean
-import Lean.Compiler.IR.LLVM
+import Lean.Compiler.IR.LLVM.Pure
+import Lean.Compiler.IR.LLVM.CodeGeneratedBy
 
-open Lean Compiler IR LLVM CodeGeneratedBy
+open Lean Compiler IR LLVM Pure Builder CodeGeneratedBy
 
-def fooImpl : CodeGenerator := fun _regs => do
-  dbg_trace "ahhhhhhhhh"
-  return 0
+def fooImpl : CodeGenerator := fun regs => do
+  Ret regs[0]!
 
 
 @[extern llvm codeGeneratedBy fooImpl]

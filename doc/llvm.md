@@ -38,4 +38,9 @@ $ leanc -o <filename>.out  <bitcode-file-name>.linked.bc.o
 $ ./filename.out
 ```
 
-
+## The issue with `Lean.Compiler.IR.LLVMBindings`
+Importing `Lean.Compiler.IR.LLVMBindings` will cause the binary to look for
+symbols from LLVM because it wants to use FFI functions from `src/library/compiler/llvm.cpp`
+which in turn call into the LLVM C API.  However `leanc` is right now not aware
+of LLVM shared library that the Lean compiler ships in its installation, this
+will hence fail to link for now.

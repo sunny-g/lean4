@@ -28,8 +28,15 @@ structure IntPredicate where
 deriving DecidableEq, BEq
 
 def IntPredicate.EQ : IntPredicate := { val := 32 }
-def IntPredicate.NE : IntPredicate := { val := IntPredicate.EQ.val + 1 }
-def IntPredicate.UGT : IntPredicate := { val := IntPredicate.NE.val + 1 }
+def IntPredicate.NE : IntPredicate := { val := 33 }
+def IntPredicate.UGT : IntPredicate := { val := 34 }
+def IntPredicate.UGE : IntPredicate := { val := 35 }
+def IntPredicate.ULT : IntPredicate := { val := 36 }
+def IntPredicate.ULE : IntPredicate := { val := 37 }
+def IntPredicate.SGT : IntPredicate := { val := 38 }
+def IntPredicate.SGE : IntPredicate := { val := 39 }
+def IntPredicate.SLT : IntPredicate := { val := 40 }
+def IntPredicate.SLE : IntPredicate := { val := 41 }
 
 structure BasicBlock (ctx : Context)  where
   private mk :: ptr : USize
