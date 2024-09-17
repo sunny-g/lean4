@@ -4,6 +4,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 Authors: Leonardo de Moura
 -/
 import Lean.Meta.WHNF
+import Lean.Meta.Transform
 import Lean.Meta.DiscrTreeTypes
 
 namespace Lean.Meta.DiscrTree
@@ -181,6 +182,31 @@ private partial def isNumeral (e : Expr) : Bool :=
       else if fName == ``Nat.zero && e.getAppNumArgs == 0 then true
       else false
 
+private partial def toNatLit? (e : Expr) : Option Literal :=
+  if isNumeral e then
+    if let some n := loop e then
+      some (.natVal n)
+    else
+      none
+  else
+    none
+where
+  loop (e : Expr) : OptionT Id Nat := do
+    let f := e.getAppFn
+    match f with
+    | .lit (.natVal n) => return n
+    | .const fName .. =>
+      if fName == ``Nat.succ && e.getAppNumArgs == 1 then
+        let r ← loop e.appArg!
+        return r+1
+      else if fName == ``OfNat.ofNat && e.getAppNumArgs == 3 then
+        loop (e.getArg! 1)
+      else if fName == ``Nat.zero && e.getAppNumArgs == 0 then
+        return 0
+      else
+        failure
+    | _ => failure
+
 private def isNatType (e : Expr) : MetaM Bool :=
   return (← whnf e).isConstOf ``Nat
 
@@ -206,16 +232,14 @@ private def isOffset (fName : Name) (e : Expr) : MetaM Bool := do
   TODO: add hook for users adding their own functions for controlling `shouldAddAsStar`
   Different `DiscrTree` users may populate this set using, for example, attributes.
 
-  Remark: we currently tag `Nat.zero` and "offset" terms to avoid having to add special
-  support for `Expr.lit` and offset terms.
+  Remark: we currently tag "offset" terms as star to avoid having to add special
+  support for offset terms.
   Example, suppose the discrimination tree contains the entry
   `Nat.succ ?m |-> v`, and we are trying to retrieve the matches for `Expr.lit (Literal.natVal 1) _`.
-  In this scenario, we want to retrieve `Nat.succ ?m |-> v` -/
+  In this scenario, we want to retrieve `Nat.succ ?m |-> v`
+-/
 private def shouldAddAsStar (fName : Name) (e : Expr) : MetaM Bool := do
-  if fName == ``Nat.zero then
-    return true
-  else
-    isOffset fName e
+  isOffset fName e
 
 def mkNoindexAnnotation (e : Expr) : Expr :=
   mkAnnotation `noindex e
@@ -253,6 +277,33 @@ private def isBadKey (fn : Expr) : Bool :=
   | _ => true
 
 /--
+  Try to eliminate loose bound variables by performing beta-reduction.
+  We use this method when processing terms in discrimination trees.
+  These trees distinguish dependent arrows from nondependent ones.
+  Recall that dependent arrows are indexed as `.other`, but nondependent arrows as `.arrow ..`.
+  Motivation: we want to "discriminate" implications and simple arrows in our index.
+
+  Now suppose we add the term `Foo (Nat → Nat)` to our index. The nested arrow appears as
+  `.arrow ..`. Then, suppose we want to check whether the index contains
+  `(x : Nat) → (fun _ => Nat) x`, but it will fail to retrieve `Foo (Nat → Nat)` because
+  it assumes the nested arrow is a dependent one and uses `.other`.
+
+  We use this method to address this issue by beta-reducing terms containing loose bound variables.
+  See issue #2232.
+
+  Remark: we expect the performance impact will be minimal.
+-/
+private def elimLooseBVarsByBeta (e : Expr) : CoreM Expr :=
+  Core.transform e
+    (pre := fun e => do
+      if !e.hasLooseBVars then
+        return .done e
+      else if e.isHeadBetaTarget then
+        return .visit e.headBeta
+      else
+        return .continue)
+
+/--
   Reduce `e` until we get an irreducible term (modulo current reducibility setting) or the resulting term
   is a bad key (see comment at `isBadKey`).
   We use this method instead of `reduce` for root terms at `pushArgs`. -/
@@ -285,9 +336,12 @@ private def pushArgs (root : Bool) (todo : Array Expr) (e : Expr) : MetaM (Key s
       let todo ← pushArgsAux info.paramInfo (nargs-1) e todo
       return (k, todo)
     match fn with
-    | .lit v         => return (.lit v, todo)
-    | .const c _     =>
+    | .lit v     =>
+      return (.lit v, todo)
+    | .const c _ =>
       unless root do
+        if let some v := toNatLit? e then
+          return (.lit v, todo)
         if (← shouldAddAsStar c e) then
           return (.star, todo)
       let nargs := e.getAppNumArgs
@@ -314,6 +368,8 @@ private def pushArgs (root : Bool) (todo : Array Expr) (e : Expr) : MetaM (Key s
       else
         return (.star, todo)
     | .forallE _ d b _ =>
+      -- See comment at elimLooseBVarsByBeta
+      let b ← if b.hasLooseBVars then elimLooseBVarsByBeta b else pure b
       if b.hasLooseBVars then
         return (.other, todo)
       else
@@ -346,8 +402,24 @@ private partial def createNodes (keys : Array (Key s)) (v : α) (i : Nat) : Trie
   else
     .node #[v] #[]
 
+/--
+If `vs` contains an element `v'` such that `v == v'`, then replace `v'` with `v`.
+Otherwise, push `v`.
+See issue #2155
+Recall that `BEq α` may not be Lawful.
+-/
 private def insertVal [BEq α] (vs : Array α) (v : α) : Array α :=
-  if vs.contains v then vs else vs.push v
+  loop 0
+where
+  loop (i : Nat) : Array α :=
+    if h : i < vs.size then
+      if v == vs[i] then
+        vs.set ⟨i,h⟩ v
+      else
+        loop (i+1)
+    else
+      vs.push v
+termination_by loop i => vs.size - i
 
 private partial def insertAux [BEq α] (keys : Array (Key s)) (v : α) : Nat → Trie α s → Trie α s
   | i, .node vs cs =>
@@ -380,6 +452,10 @@ def insert [BEq α] (d : DiscrTree α s) (e : Expr) (v : α) : MetaM (DiscrTree 
 
 private def getKeyArgs (e : Expr) (isMatch root : Bool) : MetaM (Key s × Array Expr) := do
   let e ← reduceDT e root (simpleReduce := s)
+  unless root do
+    -- See pushArgs
+    if let some v := toNatLit? e then
+      return (.lit v, #[])
   match e.getAppFn with
   | .lit v         => return (.lit v, #[])
   | .const c _     =>
@@ -445,6 +521,8 @@ private def getKeyArgs (e : Expr) (isMatch root : Bool) : MetaM (Key s × Array 
     let nargs := e.getAppNumArgs
     return (.proj s i nargs, #[a] ++ e.getAppRevArgs)
   | .forallE _ d b _ =>
+    -- See comment at elimLooseBVarsByBeta
+    let b ← if b.hasLooseBVars then elimLooseBVarsByBeta b else pure b
     if b.hasLooseBVars then
       return (.other, #[])
     else

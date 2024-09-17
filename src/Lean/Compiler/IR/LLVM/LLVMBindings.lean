@@ -17,6 +17,7 @@ are to:
 -- https://github.com/llvm/llvm-project/blob/c3e073bcbdc523b0f758d44a89a6333e38bff863/llvm/include/llvm-c/TargetMachine.h#L64
 structure CodegenFileType where
   private mk :: val : UInt64
+deriving DecidableEq, BEq
 
 def CodegenFileType.AssemblyFile : CodegenFileType := { val := 0 }
 def CodegenFileType.ObjectFile : CodegenFileType := { val := 1 }
@@ -24,10 +25,18 @@ def CodegenFileType.ObjectFile : CodegenFileType := { val := 1 }
 -- https://github.com/llvm/llvm-project/blob/c3e073bcbdc523b0f758d44a89a6333e38bff863/llvm/include/llvm-c/Core.h#L290
 structure IntPredicate where
   private mk :: val : UInt64
+deriving DecidableEq, BEq
 
 def IntPredicate.EQ : IntPredicate := { val := 32 }
-def IntPredicate.NE : IntPredicate := { val := IntPredicate.EQ.val + 1 }
-def IntPredicate.UGT : IntPredicate := { val := IntPredicate.NE.val + 1 }
+def IntPredicate.NE : IntPredicate := { val := 33 }
+def IntPredicate.UGT : IntPredicate := { val := 34 }
+def IntPredicate.UGE : IntPredicate := { val := 35 }
+def IntPredicate.ULT : IntPredicate := { val := 36 }
+def IntPredicate.ULE : IntPredicate := { val := 37 }
+def IntPredicate.SGT : IntPredicate := { val := 38 }
+def IntPredicate.SGE : IntPredicate := { val := 39 }
+def IntPredicate.SLT : IntPredicate := { val := 40 }
+def IntPredicate.SLE : IntPredicate := { val := 41 }
 
 structure BasicBlock (ctx : Context)  where
   private mk :: ptr : USize
@@ -75,6 +84,9 @@ instance : Nonempty (Value ctx) := ⟨{ ptr := default }⟩
 
 @[extern "lean_llvm_initialize_target_info"]
 opaque llvmInitializeTargetInfo : BaseIO (Unit)
+
+def BasicBlock.toValue (bb: BasicBlock ctx) : Value ctx where
+  ptr := bb.ptr
 
 @[extern "lean_llvm_create_context"]
 opaque createContext : BaseIO (Context)
@@ -171,7 +183,7 @@ opaque buildAlloca (builder : Builder ctx) (ty : LLVMType ctx) (name : @&String 
 opaque buildLoad2 (builder : Builder ctx) (ty: LLVMType ctx) (val : Value ctx) (name : @&String := "") : BaseIO (Value ctx)
 
 @[extern "lean_llvm_build_store"]
-opaque buildStore (builder : Builder ctx) (val : Value ctx) (store_loc_ptr : Value ctx) : BaseIO Unit
+opaque buildStore (builder : Builder ctx) (val : Value ctx) (store_loc_ptr : Value ctx) : BaseIO (Value ctx)
 
 @[extern "lean_llvm_build_ret"]
 opaque buildRet (builder : Builder ctx) (val : Value ctx) : BaseIO (Value ctx)
@@ -199,6 +211,14 @@ opaque buildSwitch (builder : Builder ctx) (val : Value ctx) (elseBB : BasicBloc
 
 @[extern "lean_llvm_build_ptr_to_int"]
 opaque buildPtrToInt (builder : Builder ctx) (ptr : Value ctx) (destTy : LLVMType ctx) (name : @&String := "") : BaseIO (Value ctx)
+
+@[extern "lean_llvm_build_phi"]
+opaque buildPhi (builder : Builder ctx) (ty : LLVMType ctx) (name : @&String := "") : BaseIO (LLVM.Value llvmctx)
+
+-- add incoming values into a phi node.
+@[extern "lean_llvm_add_incoming"]
+opaque addIncoming (phi: LLVM.Value llvmctx)
+  (vals : @&Array (LLVM.Value llvmctx)) (bbs : @&Array (BasicBlock llvmctx)) : BaseIO Unit
 
 @[extern "lean_llvm_build_mul"]
 opaque buildMul (builder : Builder ctx) (x y : Value ctx) (name : @&String := "") : BaseIO (Value ctx)

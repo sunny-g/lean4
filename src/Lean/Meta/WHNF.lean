@@ -155,12 +155,24 @@ private def toCtorWhenStructure (inductName : Name) (major : Expr) : MetaM Expr 
         return result
     | _ => return major
 
+
+-- Helper predicate that returns `true` for inductive predicates used to define functions by well-founded recursion.
+private def isWFRec (declName : Name) : Bool :=
+  declName == ``Acc.rec || declName == ``WellFounded.rec
+
 /-- Auxiliary function for reducing recursor applications. -/
 private def reduceRec (recVal : RecursorVal) (recLvls : List Level) (recArgs : Array Expr) (failK : Unit → MetaM α) (successK : Expr → MetaM α) : MetaM α :=
   let majorIdx := recVal.getMajorIdx
   if h : majorIdx < recArgs.size then do
     let major := recArgs.get ⟨majorIdx, h⟩
-    let mut major ← whnf major
+    let mut major ← if isWFRec recVal.name && (← getTransparency) == TransparencyMode.default then
+      -- If recursor is `Acc.rec` or `WellFounded.rec` and transparency is default,
+      -- then we bump transparency to .all to make sure we can unfold defs defined by WellFounded recursion.
+      -- We use this trick because we abstract nested proofs occurring in definitions.
+      -- Alternative design: do not abstract nested proofs used to justify well-founded recursion.
+      withTransparency .all <| whnf major
+    else
+      whnf major
     if recVal.k then
       major ← toCtorWhenK recVal major
     major := major.toCtorIfLit
@@ -708,7 +720,8 @@ mutual
       if smartUnfolding.get (← getOptions) && (← getEnv).contains (mkSmartUnfoldingNameFor declName) then
         return none
       else
-        let (some (cinfo@(ConstantInfo.defnInfo _))) ← getConstNoEx? declName | pure none
+        let some cinfo ← getConstNoEx? declName | pure none
+        unless cinfo.hasValue do return none
         deltaDefinition cinfo lvls
           (fun _ => pure none)
           (fun e => pure (some e))

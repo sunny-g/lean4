@@ -1,4 +1,4 @@
-
+set_option compiler.extract_closed false
 def tst1 : IO Unit := do
   IO.println (1 : Float)
   IO.println ((1 : Float) + 2)
